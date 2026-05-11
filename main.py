@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -20,6 +22,7 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 PORTFOLIO_URL = os.getenv("PORTFOLIO_URL")
 MIN_DAYS_FOR_ORDER = int(os.getenv("MIN_DAYS_FOR_ORDER", 3))
 MIN_DAYS_TO_CANCEL = int(os.getenv("MIN_DAYS_TO_CANCEL", 1))
+MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", 5))
 
 DB_NAME = "pastry_bot.db"
 
@@ -50,6 +53,7 @@ class OrderFSM(StatesGroup):
     waiting_for_category = State()
     waiting_for_product = State()
     waiting_for_weight = State()
+    waiting_for_phone = State()
     waiting_for_photo = State()
     waiting_for_comment = State()
 
@@ -131,12 +135,21 @@ async def process_make_order(callback: CallbackQuery, state: FSMContext):
 async def process_calendar(callback: CallbackQuery, callback_data: SimpleCalendarCallback, state: FSMContext):
     selected, date = await SimpleCalendar().process_selection(callback, callback_data)
     if selected:
-        # Получаем текущую дату (без времени, для чистого сравнения дней)
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        date_str = date.strftime("%Y-%m-%d") # Превращаем в строку для БД
         
-        # Считаем разницу в днях
         days_diff = (date - today).days
         
+        # Проверка лимита (используем строку даты)
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT COUNT(*) FROM orders WHERE target_date = ? AND status != 'cancelled'", (date_str,)) as cursor:
+                count = await cursor.fetchone()
+                if count[0] >= MAX_ORDERS_PER_DAY:
+                    await callback.message.answer(f"⚠️ На {date_str} мест нет (макс. {MAX_ORDERS_PER_DAY}). Выберите другую дату:")
+                    return
+        
+        await state.update_data(target_date=date)
+
         if days_diff < MIN_DAYS_FOR_ORDER:
             await callback.message.answer(
                 f"⚠️ Заказ можно оформить минимум за {MIN_DAYS_FOR_ORDER} дня.\n"
@@ -198,7 +211,23 @@ async def process_product(callback: CallbackQuery, state: FSMContext):
 @router.message(OrderFSM.waiting_for_weight)
 async def process_weight(message: Message, state: FSMContext):
     await state.update_data(weight=message.text)
-    await message.answer("Прикрепите фото-референс (картинку того, что вы хотите), либо нажмите /skip:")
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить контакт", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("Пожалуйста, поделитесь вашим номером телефона для связи:", reply_markup=kb)
+    await state.set_state(OrderFSM.waiting_for_phone)
+
+@router.message(OrderFSM.waiting_for_phone, F.contact | F.text)
+async def process_phone(message: Message, state: FSMContext):
+    phone = message.contact.phone_number if message.contact else message.text
+    await state.update_data(phone=phone)
+    
+    from aiogram.types import ReplyKeyboardRemove
+    await message.answer("Принято! Теперь прикрепите фото-референс или введите /skip:", 
+                         reply_markup=ReplyKeyboardRemove())
     await state.set_state(OrderFSM.waiting_for_photo)
 
 @router.message(OrderFSM.waiting_for_photo)
@@ -218,38 +247,34 @@ async def process_photo(message: Message, state: FSMContext):
 
 @router.message(OrderFSM.waiting_for_comment)
 async def process_comment(message: Message, state: FSMContext):
-    # 1. Сначала сохраняем текст комментария в состояние
     await state.update_data(comment=message.text)
-    
-    # 2. Теперь достаем обновленные данные, где 'comment' уже точно есть
     data = await state.get_data()
     
-    # Формируем название (убедимся, что product_name тоже на месте)
     product = data.get('product_name', 'Не указано')
     category = data.get('category', 'Не указано')
     full_item_name = f"{category}: {product}"
+    phone = data.get('phone', 'Не указан')
     
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             "INSERT INTO orders (user_id, username, target_date, category, weight, ref_photo, comment) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                message.from_user.id, 
-                message.from_user.username, 
-                data.get('target_date'), 
-                full_item_name, 
-                data.get('weight'), 
-                data.get('ref_photo'), 
-                message.text  # Можно брать напрямую из message.text
-            )
+            (message.from_user.id, message.from_user.username, data.get('target_date'), 
+             full_item_name, data.get('weight'), data.get('ref_photo'), message.text)
         )
         order_id = cursor.lastrowid
         await db.commit()
 
-    await message.answer(f"✅ Ваш заказ #{order_id} успешно оформлен!")
+    # Вспомогательная функция для кнопок (лучше вынести её из обработчика)
+    kb_builder = InlineKeyboardBuilder()
+    kb_builder.button(text="✅ Подтвердить", callback_data=f"confirm_{order_id}_{message.from_user.id}")
+    kb_builder.button(text="❌ Отклонить", callback_data=f"reject_{order_id}_{message.from_user.id}")
+    admin_kb = kb_builder.as_markup()
+
+    await message.answer(f"✅ Ваш заказ #{order_id} успешно оформлен! Ожидайте подтверждения.")
     
-    # Уведомление админам
     admin_text = (f"🔔 <b>Новый заказ #{order_id}</b>\n"
                   f"👤 Клиент: @{message.from_user.username}\n"
+                  f"📞 Тел: {phone}\n"
                   f"🎂 Изделие: <b>{full_item_name}</b>\n"
                   f"📅 Дата: {data.get('target_date')}\n"
                   f"⚖️ Вес: {data.get('weight')}\n"
@@ -258,11 +283,11 @@ async def process_comment(message: Message, state: FSMContext):
     for admin in ADMIN_IDS:
         try:
             if data.get('ref_photo'):
-                await bot.send_photo(admin, photo=data['ref_photo'], caption=admin_text, parse_mode="HTML")
+                await bot.send_photo(admin, photo=data['ref_photo'], caption=admin_text, parse_mode="HTML", reply_markup=admin_kb)
             else:
-                await bot.send_message(admin, admin_text, parse_mode="HTML")
+                await bot.send_message(admin, admin_text, parse_mode="HTML", reply_markup=admin_kb)
         except Exception as e:
-            print(f"Ошибка отправки админу: {e}")
+            print(f"Ошибка уведомления админа: {e}")
 
     await state.clear()
 
@@ -298,6 +323,55 @@ async def admin_view_orders(callback: CallbackQuery):
         else:
             await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_"))
+async def admin_confirm_order(callback: CallbackQuery):
+    _, order_id, user_id = callback.data.split("_")
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE orders SET status = 'confirmed' WHERE id = ?", (order_id,))
+        await db.commit()
+    
+    # Проверяем, есть ли подпись (фото) или просто текст
+    new_status = "\n\n✅ <b>ПОДТВЕРЖДЕНО</b>"
+    
+    if callback.message.caption:
+        await callback.message.edit_caption(
+            caption=callback.message.caption + new_status, 
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            text=callback.message.text + new_status, 
+            parse_mode="HTML"
+        )
+        
+    await bot.send_message(user_id, f"🌟 Ваш заказ №{order_id} подтвержден кондитером и принят в работу!")
+    await callback.answer("Заказ подтвержден")
+
+@router.callback_query(F.data.startswith("reject_"))
+async def admin_reject_order(callback: CallbackQuery):
+    _, order_id, user_id = callback.data.split("_")
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE orders SET status = 'cancelled' WHERE id = ?", (order_id,))
+        await db.commit()
+    
+    new_status = "\n\n❌ <b>ОТКЛОНЕН</b>"
+    
+    if callback.message.caption:
+        await callback.message.edit_caption(
+            caption=callback.message.caption + new_status, 
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            text=callback.message.text + new_status, 
+            parse_mode="HTML"
+        )
+        
+    await bot.send_message(user_id, f"😔 К сожалению, кондитер не сможет выполнить ваш заказ №{order_id} и отклонил его.")
+    await callback.answer("Заказ отклонен")
 
 @router.callback_query(F.data == "admin_broadcast")
 async def start_broadcast(callback: CallbackQuery, state: FSMContext):
@@ -374,30 +448,10 @@ async def admin_add_price_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminPriceFSM.waiting_for_category)
 async def price_category(message: Message, state: FSMContext):
-    # Очищаем от лишних пробелов и делаем первую букву заглавной для единообразия
     category_name = message.text.strip().capitalize()
     await state.update_data(cat=category_name)
     await message.answer(f"Категория: {category_name}\nТеперь введите название изделия:")
     await state.set_state(AdminPriceFSM.waiting_for_name)
-
-@router.message(AdminPriceFSM.waiting_for_price)
-async def price_final(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("Пожалуйста, введите только число.")
-        return
-    
-    data = await state.get_data()
-    async with aiosqlite.connect(DB_NAME) as db:
-        # Просто вставляем новую строку. 
-        # Если категория уже существует, в SELECT DISTINCT она все равно будет одна.
-        await db.execute(
-            "INSERT INTO price_list (category, name, price) VALUES (?, ?, ?)",
-            (data['cat'], data['name'], int(message.text))
-        )
-        await db.commit()
-    
-    await message.answer(f"✅ В категорию '{data['cat']}' добавлен товар: {data['name']} ({message.text} руб.)")
-    await state.clear()
 
 @router.message(AdminPriceFSM.waiting_for_name)
 async def price_name(message: Message, state: FSMContext):
