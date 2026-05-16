@@ -23,6 +23,7 @@ PORTFOLIO_URL = os.getenv("PORTFOLIO_URL")
 MIN_DAYS_FOR_ORDER = int(os.getenv("MIN_DAYS_FOR_ORDER", 3))
 MIN_DAYS_TO_CANCEL = int(os.getenv("MIN_DAYS_TO_CANCEL", 1))
 MAX_ORDERS_PER_DAY = int(os.getenv("MAX_ORDERS_PER_DAY", 5))
+REMINDER_HOURS_BEFORE = int(os.getenv("REMINDER_HOURS_BEFORE", 24))
 
 DB_NAME = "pastry_bot.db"
 
@@ -33,18 +34,36 @@ router = Router()
 # --- 2. БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        # Новая таблица для всех пользователей
-        await db.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)''')
-        
-        await db.execute('''CREATE TABLE IF NOT EXISTS price_list (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            category TEXT, name TEXT, price REAL)''')
-        
-        await db.execute('''CREATE TABLE IF NOT EXISTS orders (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER, username TEXT, target_date TEXT, 
-                            category TEXT, weight TEXT, ref_photo TEXT, 
-                            comment TEXT, status TEXT DEFAULT 'pending')''')
+        # Таблица пользователей
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT
+            )
+        """)
+        # Таблица заказов (Добавили STATUS с дефолтным значением)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                target_date TEXT,
+                category TEXT,
+                weight TEXT,
+                ref_photo TEXT,
+                comment TEXT,
+                status TEXT DEFAULT 'pending'
+            )
+        """)
+        # Таблица прайс-листа
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS price_list (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT,
+                name TEXT,
+                price INTEGER
+            )
+        """)
         await db.commit()
 
 # --- 3. МАШИНА СОСТОЯНИЙ (FSM) ---
@@ -147,8 +166,6 @@ async def process_calendar(callback: CallbackQuery, callback_data: SimpleCalenda
                 if count[0] >= MAX_ORDERS_PER_DAY:
                     await callback.message.answer(f"⚠️ На {date_str} мест нет (макс. {MAX_ORDERS_PER_DAY}). Выберите другую дату:")
                     return
-        
-        await state.update_data(target_date=date)
 
         if days_diff < MIN_DAYS_FOR_ORDER:
             await callback.message.answer(
@@ -299,30 +316,44 @@ STATUS_MAP = {
 
 @router.callback_query(F.data == "admin_orders")
 async def admin_view_orders(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS: return
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("У вас нет доступа.", show_alert=True)
+        return
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Выбираем все нужные поля
-        async with db.execute("SELECT id, username, target_date, category, weight, comment, ref_photo FROM orders WHERE status = 'pending'") as cursor:
+        # Ищем все заказы, кроме отмененных
+        async with db.execute(
+            "SELECT id, username, target_date, category, weight, comment, ref_photo, status FROM orders WHERE status != 'cancelled'"
+        ) as cursor:
             orders = await cursor.fetchall()
 
     if not orders:
-        await callback.answer("Новых заказов нет", show_alert=True)
+        await callback.message.answer("Активных заказов пока нет.")
+        await callback.answer()
         return
 
-    for o_id, user, date, item_name, weight, comm, photo in orders:
-        text = (f"📦 <b>Заказ #{o_id}</b>\n"
-                f"👤 Клиент: @{user}\n"
-                f"🎂 Изделие: <b>{item_name}</b>\n" # Теперь здесь будет "Торты: Медовик"
-                f"📅 Дата: {date}\n"
-                f"⚖️ Вес: {weight}\n"
-                f"📝 Коммент: {comm}")
-        
+    for o_id, username, t_date, cat, weight, comment, photo, status in orders:
+        # Красивый статус для кондитера
+        status_emoji = "⏳ Ожидает" if status == "pending" else "✅ В работе"
+        if status == "reminded":
+            status_emoji = "⏰ Напомнено"
+
+        text = (f"📦 <b>Заказ #{o_id}</b> [{status_emoji}]\n"
+                f"👤 Клиент: @{username}\n"
+                f"📅 Дата готовности: {t_date}\n"
+                f"🎂 Изделие: {cat}\n"
+                f"秤 Вес: {weight}\n"
+                f"💬 ТЗ/Коммент: {comment}")
+
         if photo:
-            await callback.message.answer_photo(photo, caption=text, parse_mode="HTML")
+            try:
+                await callback.message.answer_photo(photo, caption=text, parse_mode="HTML")
+            except Exception:
+                await callback.message.answer(text + "\n\n⚠️ (Не удалось загрузить фото-референс)", parse_mode="HTML")
         else:
             await callback.message.answer(text, parse_mode="HTML")
-    await callback.answer()
+            
+    await callback.answer() # Обязательно гасим часики на кнопке
 
 @router.callback_query(F.data.startswith("confirm_"))
 async def admin_confirm_order(callback: CallbackQuery):
@@ -517,12 +548,65 @@ async def process_cancel(callback: CallbackQuery):
         except Exception:
             pass
 
+async def reminder_scheduler():
+    """Фоновая задача, которая проверяет заказы раз в час и присылает напоминания."""
+    print("Запущен фоновый планировщик напоминаний...")
+    while True:
+        print("ℹ️ Планировщик проверяет базу данных...")
+        try:
+            # Высчитываем целевую дату на основе настроек из .env
+            # Если торт нужен завтра, а напоминание за 24 часа — ищем заказы на завтра
+            target_datetime = datetime.now() + timedelta(hours=REMINDER_HOURS_BEFORE)
+            target_date_str = target_datetime.strftime("%Y-%m-%d")
+
+            async with aiosqlite.connect(DB_NAME) as db:
+                # Ищем подтвержденные заказы на эту дату, по которым еще не отправлено напоминание
+                # Чтобы не спамить каждый час, мы временно проверяем статус 'confirmed'
+                async with db.execute(
+                    "SELECT id, username, category, weight, comment FROM orders WHERE target_date = ? AND status = 'confirmed'", 
+                    (target_date_str,)
+                ) as cursor:
+                    orders = await cursor.fetchall()
+
+                if orders:
+                    for o_id, username, item_name, weight, comm in orders:
+                        reminder_text = (
+                            f"⏰ <b>НАПОМИНАНИЕ О ЗАКАЗЕ!</b>\n\n"
+                            f"📦 <b>Заказ #{o_id}</b> должен быть готов через {REMINDER_HOURS_BEFORE} ч.\n"
+                            f"👤 Клиент: @{username}\n"
+                            f"🎂 Изделие: <b>{item_name}</b>\n"
+                            f"⚖️ Вес: {weight}\n"
+                            f"📝 Детали: {comm}"
+                        )
+                        
+                        for admin in ADMIN_IDS:
+                            try:
+                                await bot.send_message(admin, reminder_text, parse_mode="HTML")
+                            except Exception as e:
+                                print(f"Не удалось отправить напоминание админу {admin}: {e}")
+                        
+                        # Обновляем статус заказа в 'reminded', чтобы бот не присылал уведомление повторно через час
+                        await db.execute("UPDATE orders SET status = 'reminded' WHERE id = ?", (o_id,))
+                    
+                    await db.commit()
+
+        except Exception as e:
+            print(f"Ошибка в планировщике напоминаний: {e}")
+        
+        # Спим ровно 1 час (3600 секунд) перед следующей проверкой
+        await asyncio.sleep(5)
+
 
 async def main():
     await init_db()
     dp.include_router(router)
     print("Bot is starting...")
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # Запускаем планировщик напоминаний в фоне асинхронно
+    asyncio.create_task(reminder_scheduler())
+    
+    # Запускаем опрос бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
