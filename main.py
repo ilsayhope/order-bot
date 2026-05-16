@@ -594,7 +594,7 @@ async def reminder_scheduler():
             print(f"Ошибка в планировщике напоминаний: {e}")
         
         # Спим ровно 1 час (3600 секунд) перед следующей проверкой
-        await asyncio.sleep(5)
+        await asyncio.sleep(3600)
 
 
 async def main():
